@@ -1,7 +1,9 @@
+#include <openssl/evp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -10,127 +12,118 @@
 #include <netdb.h>
 #include <unistd.h>
 
-
 #define CLIENTES 10
 #define PORT 9999
 #define buff_size 2048
+#define RUTA_TAM 64
 
-int identificarSalida(char *mensaje);                               // Funcion que determina cuando se debe salir del programa 
+int identificarSalida(char *mensaje);
+void imprimirFirma(const unsigned char* buf, size_t len);
 
 int main()
 {
-    // Variables requeridas para levantar el servidor  
-    struct sockaddr_in servidor;
-    struct sockaddr_in cliente;
+    struct sockaddr_in servidor, cliente;
     struct hostent* info_cliente;
-    int fd_s, fd_c, n, num_cli = 1;
+    int fd_s, fd_c, n;
     int longClient;
     char buf[buff_size];
+    int sigue = 1;
 
-    // Variables de flujo para comunicacion
-    int sigue = 1;                                                  // Variable para controlar el loop while
-    
-    // Generamos el File Descriptor para el servidor
     fd_s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	      
-    // Se inicializan los valores del servidor (struct sockaddr_in)
-    memset((char *) &servidor, 0, sizeof(servidor));
+    memset(&servidor, 0, sizeof(servidor));
     servidor.sin_family = AF_INET;
     servidor.sin_addr.s_addr = INADDR_ANY;
-    servidor.sin_port = htons((u_short) PORT);
+    servidor.sin_port = htons(PORT);
     memset(&(servidor.sin_zero), '\0', 8);
 
-    // Asocia el descriptor de archivo del servidor con su estructura correspondiente
     bind(fd_s, (struct sockaddr *) &servidor, sizeof(servidor));
-
-    // Espera solicitud de conexión
     printf("Esperando conexión...\n");
     listen(fd_s, CLIENTES);
 
     longClient = sizeof(cliente);
 
-while(1){
+    while (1) {
+        fd_c = accept(fd_s, (struct sockaddr *) &cliente, &longClient);
+        info_cliente = gethostbyaddr((char *) &cliente.sin_addr, sizeof(struct in_addr), AF_INET);
 
-    // Establece conexión y genera File Descriptor para el cliente
-    fd_c = accept(fd_s, (struct sockaddr *) &cliente, &longClient);
+        if (fork() == 0) {
+            char id_dispo[3];
+            memset(buf, '\0', buff_size);
+            n = recv(fd_c, buf, 3, MSG_WAITALL);
+            buf[3] = '\0';
+            strncpy(id_dispo, buf, 3);
+            printf("\nDispositivo %s conectado desde: %s\n", id_dispo, info_cliente->h_name);
 
-    // Obtiene la información del cliente y muestra desde donde se realiza la conexión
-    info_cliente = gethostbyaddr((char *) &cliente.sin_addr, sizeof(struct in_addr), AF_INET);
-    printf("Dispositivo %i conectado desde: %s\n\n", num_cli, info_cliente -> h_name);
+            // leer archivo de firma
+            char ruta_firma[RUTA_TAM];
+            snprintf(ruta_firma, RUTA_TAM, "firmas/firma_%s.txt", id_dispo);
+            FILE* f = fopen(ruta_firma, "rb");
+            if (!f) {
+                perror("Error al abrir firma");
+                close(fd_c);
+                exit(1);
+            }
 
-    if (fork() == 0 )
-    {
+            unsigned char firma[256];
+            size_t firma_len = fread(firma, 1, sizeof(firma), f);
+            fclose(f);
 
-// ------------------------------------ Recepción de mensajes
-        while (sigue != 0)
-        {
-            
-            do{
-            // Utiliza la variable n para detectar si ha recibido peticiones
-            memset(&(buf), '\0', buff_size);
-            n = recv(fd_c, buf, sizeof(buf), 0);
-            
-            // Colocamos NULL al final del buffer
-            buf[n] = (char*)0;
-            
-            // Se omiten las respuestas que no tinen argumentos
-            } while (*buf < 1);
+            printf("Firma recibida desde archivo (%zu bytes):\n", firma_len);
+            imprimirFirma(firma, firma_len);
 
-            // Se valida que el primer comando sea distinto de 'exit'
-            sigue = identificarSalida(buf);
-            
-            // Cuandos se identifica un 'exit' se termina la ejecucion y notifica al cliente
-            if (!sigue){  
-                send(fd_c, "exit", 5, 0);
-                break;}                                             
-            
-            // Da respuesta al cliente
-            send(fd_c, "Recibido", 8, 0);
+            // ciclo de mensajes
+            while (sigue != 0) {
+                do {
+                    memset(buf, '\0', buff_size);
+                    n = recv(fd_c, buf, sizeof(buf), 0);
+                    buf[n] = '\0';
+                } while (*buf < 1);
+
+                sigue = identificarSalida(buf);
+                if (!sigue) {
+                    send(fd_c, "exit", 5, 0);
+                    break;
+                }
+
+                send(fd_c, "Recibido", 8, 0);
+            }
+
+            close(fd_c);
+            printf("Conexion con Dispositivo %s finalizada\n", id_dispo);
+            exit(0);
+        } else {
+            close(fd_c);
         }
-
-    // Finalizamos la conexión cerrando el File Descriptor del cliente
-    close(fd_c);
-    printf("\nConexion con Dispositivo %i finalizada\n", num_cli);
-    exit(0);
-    }
-    
-    // El proceso padre cierra el descriptor del cliente y sigue aceptando peticiones
-    else 
-    {
-        close(fd_c);
-        ++num_cli;
     }
 
-// ----------------------------------------------------------------------------------------
-} // cierra while(1)
-
-    // Dejamos de responder solicitudes cerrando el File Descriptor del servidor
     close(fd_s);
-    shutdown( fd_s, SHUT_RDWR );
-    exit(0);
+    shutdown(fd_s, SHUT_RDWR);
+    return 0;
 }
 
 int identificarSalida(char *mensaje)
 {
-    int contador = 0;                                           // Contador para recorrer el arreglo
-    int receptor = 0;                                           // Contador para el numero efectivo de caracteres leídos
-    char exit[4];                                               // Arreglo que recibe los caracteres efectivos leídos
+    int contador = 0, receptor = 0;
+    char exit[4];
 
-    while(contador < 256)                                        // El limite del contador es el tamaño del arreglo
-    {
-        if (isblank(mensaje[contador]))                         // Si no hay un caracter, el contador avanza
-        {
+    while (contador < 256) {
+        if (isblank(mensaje[contador])) {
             contador++;
-        } else
-        {
-            exit[receptor] = mensaje[contador];                 // Si es un caracter, se guarda y aumentan los contadores
-            contador++;                                         
-            receptor++;
+        } else {
+            exit[receptor++] = mensaje[contador++];
         }
 
-        if (receptor == 4)                                      // Cuando el receptor llega a 4 se han leido 4 caracteres
-        {
-            return strcmp(exit, "exit");                        // Si se ingreso el comando exit, la salida será 0;
+        if (receptor == 4) {
+            return strcmp(exit, "exit");
         }
     }
+}
+
+void imprimirFirma(const unsigned char* buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X", buf[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
+        else printf(" ");
+    }
+    printf("\n");
 }
